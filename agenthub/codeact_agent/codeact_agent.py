@@ -1,5 +1,4 @@
-import re
-
+from agenthub.codeact_agent.action_parser import CodeActResponseParser
 from agenthub.codeact_agent.prompt import (
     COMMAND_DOCS,
     EXAMPLES,
@@ -11,17 +10,18 @@ from opendevin.controller.agent import Agent
 from opendevin.controller.state.state import State
 from opendevin.events.action import (
     Action,
+    AgentDelegateAction,
     AgentFinishAction,
-    BrowseInteractiveAction,
     CmdRunAction,
     IPythonRunCellAction,
     MessageAction,
 )
 from opendevin.events.observation import (
-    BrowserOutputObservation,
+    AgentDelegateObservation,
     CmdOutputObservation,
     IPythonRunCellObservation,
 )
+from opendevin.events.serialization.event import truncate_content
 from opendevin.llm.llm import LLM
 from opendevin.runtime.plugins import (
     AgentSkillsRequirement,
@@ -33,21 +33,13 @@ from opendevin.runtime.tools import RuntimeTool
 ENABLE_GITHUB = True
 
 
-def parse_response(response) -> str:
-    action = response.choices[0].message.content
-    for lang in ['bash', 'ipython', 'browse']:
-        if f'<execute_{lang}>' in action and f'</execute_{lang}>' not in action:
-            action += f'</execute_{lang}>'
-    return action
-
-
 def action_to_str(action: Action) -> str:
     if isinstance(action, CmdRunAction):
         return f'{action.thought}\n<execute_bash>\n{action.command}\n</execute_bash>'
     elif isinstance(action, IPythonRunCellAction):
         return f'{action.thought}\n<execute_ipython>\n{action.code}\n</execute_ipython>'
-    elif isinstance(action, BrowseInteractiveAction):
-        return f'{action.thought}\n<execute_browse>\n{action.browser_actions}\n</execute_browse>'
+    elif isinstance(action, AgentDelegateAction):
+        return f'{action.thought}\n<execute_browse>\n{action.inputs["task"]}\n</execute_browse>'
     elif isinstance(action, MessageAction):
         return action.content
     return ''
@@ -55,7 +47,7 @@ def action_to_str(action: Action) -> str:
 
 def get_action_message(action: Action) -> dict[str, str] | None:
     if (
-        isinstance(action, BrowseInteractiveAction)
+        isinstance(action, AgentDelegateAction)
         or isinstance(action, CmdRunAction)
         or isinstance(action, IPythonRunCellAction)
         or isinstance(action, MessageAction)
@@ -69,9 +61,9 @@ def get_action_message(action: Action) -> dict[str, str] | None:
 
 def get_observation_message(obs) -> dict[str, str] | None:
     if isinstance(obs, CmdOutputObservation):
-        content = 'OBSERVATION:\n' + truncate_observation(obs.content)
+        content = 'OBSERVATION:\n' + truncate_content(obs.content)
         content += (
-            f'\n[Command {obs.command_id} finished with exit code {obs.exit_code}]]'
+            f'\n[Command {obs.command_id} finished with exit code {obs.exit_code}]'
         )
         return {'role': 'user', 'content': content}
     elif isinstance(obs, IPythonRunCellObservation):
@@ -84,26 +76,12 @@ def get_observation_message(obs) -> dict[str, str] | None:
                     '![image](data:image/png;base64, ...) already displayed to user'
                 )
         content = '\n'.join(splitted)
-        content = truncate_observation(content)
+        content = truncate_content(content)
         return {'role': 'user', 'content': content}
-    elif isinstance(obs, BrowserOutputObservation):
-        content = 'OBSERVATION:\n' + truncate_observation(obs.content)
+    elif isinstance(obs, AgentDelegateObservation):
+        content = 'OBSERVATION:\n' + truncate_content(str(obs.outputs))
         return {'role': 'user', 'content': content}
     return None
-
-
-def truncate_observation(observation: str, max_chars: int = 10_000) -> str:
-    """
-    Truncate the middle of the observation if it is too long.
-    """
-    if len(observation) <= max_chars:
-        return observation
-    half = max_chars // 2
-    return (
-        observation[:half]
-        + '\n[... Observation truncated due to length ...]\n'
-        + observation[-half:]
-    )
 
 
 # FIXME: We can tweak these two settings to create MicroAgents specialized toward different area
@@ -119,7 +97,7 @@ def get_in_context_example() -> str:
 
 
 class CodeActAgent(Agent):
-    VERSION = '1.5'
+    VERSION = '1.7'
     """
     The Code Act Agent is a minimalist agent.
     The agent works by passing the model a list of action-observation pairs and prompting the model to take the next step.
@@ -164,10 +142,11 @@ class CodeActAgent(Agent):
         JupyterRequirement(),
     ]
     runtime_tools: list[RuntimeTool] = [RuntimeTool.BROWSER]
-    jupyter_kernel_init_code: str = 'from agentskills import *'
 
     system_message: str = get_system_message()
     in_context_example: str = f"Here is an example of how you can interact with the environment for task solving:\n{get_in_context_example()}\n\nNOW, LET'S START!"
+
+    action_parser = CodeActResponseParser()
 
     def __init__(
         self,
@@ -199,7 +178,7 @@ class CodeActAgent(Agent):
         Returns:
         - CmdRunAction(command) - bash command to run
         - IPythonRunCellAction(code) - IPython code to run
-        - BrowseInteractiveAction(browsergym_command) - BrowserGym commands to run
+        - AgentDelegateAction(agent, inputs) - delegate action for (sub)task
         - MessageAction(content) - Message action to run (e.g. ask for clarification)
         - AgentFinishAction() - end the interaction
         """
@@ -225,7 +204,7 @@ class CodeActAgent(Agent):
                 f'\n\nENVIRONMENT REMINDER: You have {state.max_iterations - state.iteration} turns left to complete the task.'
             )
 
-        response = self.llm.do_completion(
+        response = self.llm.completion(
             messages=messages,
             stop=[
                 '</execute_ipython>',
@@ -234,50 +213,7 @@ class CodeActAgent(Agent):
             ],
             temperature=0.0,
         )
-
-        action_str: str = parse_response(response)
-        state.num_of_chars += sum(
-            len(message['content']) for message in messages
-        ) + len(action_str)
-
-        if finish_command := re.search(r'<finish>.*</finish>', action_str, re.DOTALL):
-            thought = action_str.replace(finish_command.group(0), '').strip()
-            return AgentFinishAction(thought=thought)
-        if bash_command := re.search(
-            r'<execute_bash>(.*?)</execute_bash>', action_str, re.DOTALL
-        ):
-            # remove the command from the action string to get thought
-            thought = action_str.replace(bash_command.group(0), '').strip()
-            # a command was found
-            command_group = bash_command.group(1).strip()
-
-            if command_group.strip() == 'exit':
-                return AgentFinishAction()
-            return CmdRunAction(command=command_group, thought=thought)
-        elif python_code := re.search(
-            r'<execute_ipython>(.*?)</execute_ipython>', action_str, re.DOTALL
-        ):
-            # a code block was found
-            code_group = python_code.group(1).strip()
-            thought = action_str.replace(python_code.group(0), '').strip()
-            return IPythonRunCellAction(
-                code=code_group,
-                thought=thought,
-                kernel_init_code=self.jupyter_kernel_init_code,
-            )
-        elif browse_command := re.search(
-            r'<execute_browse>(.*)</execute_browse>', action_str, re.DOTALL
-        ):
-            # BrowserGym actions was found
-            browse_actions = browse_command.group(1).strip()
-            thought = action_str.replace(browse_command.group(0), '').strip()
-            return BrowseInteractiveAction(
-                browser_actions=browse_actions, thought=thought
-            )
-        else:
-            # We assume the LLM is GOOD enough that when it returns pure natural language
-            # it want to talk to the user
-            return MessageAction(content=action_str, wait_for_response=True)
+        return self.action_parser.parse(response)
 
     def search_memory(self, query: str) -> list[str]:
         raise NotImplementedError('Implement this abstract method')

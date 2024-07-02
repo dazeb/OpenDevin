@@ -5,6 +5,7 @@ import pathlib
 import platform
 import uuid
 from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from types import UnionType
 from typing import Any, ClassVar, get_args, get_origin
 
@@ -38,7 +39,7 @@ class LLMConfig(metaclass=Singleton):
         retry_min_wait: The minimum time to wait between retries, in seconds. This is exponential backoff minimum. For models with very low limits, this can be set to 15-20.
         retry_max_wait: The maximum time to wait between retries, in seconds. This is exponential backoff maximum.
         timeout: The timeout for the API.
-        max_chars: The maximum number of characters to send to and receive from the API. This is a fallback for token counting, which doesn't work in all cases.
+        max_message_chars: The approximate max number of characters in the content of an event included in the prompt to the LLM. Larger observations are truncated.
         temperature: The temperature for the API.
         top_p: The top p for the API.
         custom_llm_provider: The custom LLM provider to use. This is undocumented in opendevin, and normally not used. It is documented on the litellm side.
@@ -62,7 +63,7 @@ class LLMConfig(metaclass=Singleton):
     retry_min_wait: int = 3
     retry_max_wait: int = 60
     timeout: int | None = None
-    max_chars: int = 5_000_000  # fallback for token counting
+    max_message_chars: int = 10_000  # maximum number of characters in an observation's content when sent to the llm
     temperature: float = 0
     top_p: float = 0.5
     custom_llm_provider: str | None = None
@@ -122,6 +123,10 @@ class AgentConfig(metaclass=Singleton):
         return dict
 
 
+class UndefinedString(str, Enum):
+    UNDEFINED = 'UNDEFINED'
+
+
 @dataclass
 class AppConfig(metaclass=Singleton):
     """
@@ -149,9 +154,12 @@ class AppConfig(metaclass=Singleton):
         disable_color: Whether to disable color. For terminals that don't support color.
         sandbox_user_id: The user ID for the sandbox.
         sandbox_timeout: The timeout for the sandbox.
-        github_token: The GitHub token.
         debug: Whether to enable debugging.
         enable_auto_lint: Whether to enable auto linting. This is False by default, for regular runs of the app. For evaluation, please set this to True.
+        enable_cli_session: Whether to enable saving and restoring the session when run from CLI.
+        file_uploads_max_file_size_mb: Maximum file size for uploads in megabytes. 0 means no limit.
+        file_uploads_restrict_file_types: Whether to restrict file types for file uploads. Defaults to False.
+        file_uploads_allowed_extensions: List of allowed file extensions for uploads. ['.*'] means all extensions are allowed.
     """
 
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -160,7 +168,9 @@ class AppConfig(metaclass=Singleton):
     file_store: str = 'memory'
     file_store_path: str = '/tmp/file_store'
     workspace_base: str = os.path.join(os.getcwd(), 'workspace')
-    workspace_mount_path: str | None = None
+    workspace_mount_path: str = (
+        UndefinedString.UNDEFINED  # this path should always be set when config is fully loaded
+    )
     workspace_mount_path_in_sandbox: str = '/workspace'
     workspace_mount_rewrite: str | None = None
     cache_dir: str = '/tmp/cache'
@@ -179,15 +189,19 @@ class AppConfig(metaclass=Singleton):
     disable_color: bool = False
     sandbox_user_id: int = os.getuid() if hasattr(os, 'getuid') else 1000
     sandbox_timeout: int = 120
+    initialize_plugins: bool = True
     persist_sandbox: bool = False
     ssh_port: int = 63710
     ssh_password: str | None = None
-    github_token: str | None = None
     jwt_secret: str = uuid.uuid4().hex
     debug: bool = False
     enable_auto_lint: bool = (
         False  # once enabled, OpenDevin would lint files after editing
     )
+    enable_cli_session: bool = False
+    file_uploads_max_file_size_mb: int = 0
+    file_uploads_restrict_file_types: bool = False
+    file_uploads_allowed_extensions: list[str] = field(default_factory=lambda: ['.*'])
 
     defaults_dict: ClassVar[dict] = {}
 
@@ -218,7 +232,12 @@ class AppConfig(metaclass=Singleton):
             attr_name = f.name
             attr_value = getattr(self, f.name)
 
-            if attr_name in ['e2b_api_key', 'github_token']:
+            if attr_name in [
+                'e2b_api_key',
+                'github_token',
+                'jwt_secret',
+                'ssh_password',
+            ]:
                 attr_value = '******' if attr_value else None
 
             attr_str.append(f'{attr_name}={repr(attr_value)}')
@@ -334,9 +353,9 @@ def load_from_toml(config: AppConfig, toml_file: str = 'config.toml'):
     except FileNotFoundError as e:
         logger.info(f'Config file not found: {e}')
         return
-    except toml.TomlDecodeError:
+    except toml.TomlDecodeError as e:
         logger.warning(
-            'Cannot parse config from toml, toml values have not been applied.',
+            f'Cannot parse config from toml, toml values have not been applied.\nError: {e}',
             exc_info=False,
         )
         return
@@ -362,9 +381,9 @@ def load_from_toml(config: AppConfig, toml_file: str = 'config.toml'):
 
         # update the config object with the new values
         config = AppConfig(llm=llm_config, agent=agent_config, **core_config)
-    except (TypeError, KeyError):
+    except (TypeError, KeyError) as e:
         logger.warning(
-            'Cannot parse config from toml, toml values have not been applied.',
+            f'Cannot parse config from toml, toml values have not been applied.\nError: {e}',
             exc_info=False,
         )
 
@@ -375,7 +394,7 @@ def finalize_config(config: AppConfig):
     """
 
     # Set workspace_mount_path if not set by the user
-    if config.workspace_mount_path is None:
+    if config.workspace_mount_path is UndefinedString.UNDEFINED:
         config.workspace_mount_path = os.path.abspath(config.workspace_base)
     config.workspace_base = os.path.abspath(config.workspace_base)
 
@@ -505,13 +524,6 @@ def get_parser():
         default=config.max_budget_per_task,
         type=float,
         help='The maximum budget allowed per task, beyond which the agent will stop.',
-    )
-    parser.add_argument(
-        '-n',
-        '--max-chars',
-        default=config.llm.max_chars,
-        type=int,
-        help='The maximum number of characters to send to and receive from LLM per task',
     )
     # --eval configs are for evaluations only
     parser.add_argument(

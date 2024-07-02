@@ -1,4 +1,5 @@
 import agenthub.monologue_agent.utils.prompts as prompts
+from agenthub.monologue_agent.response_parser import MonologueResponseParser
 from agenthub.monologue_agent.utils.prompts import INITIAL_THOUGHTS
 from opendevin.controller.agent import Agent
 from opendevin.controller.state.state import State
@@ -48,6 +49,7 @@ class MonologueAgent(Agent):
     memory: 'LongTermMemory | None'
     memory_condenser: MemoryCondenser
     runtime_tools: list[RuntimeTool] = [RuntimeTool.BROWSER]
+    response_parser = MonologueResponseParser()
 
     def __init__(self, llm: LLM):
         """
@@ -157,14 +159,12 @@ class MonologueAgent(Agent):
             if not isinstance(prev_action, NullAction):
                 recent_events.append(event_to_memory(prev_action))
             if not isinstance(obs, NullObservation):
-                recent_events.append(self._truncate_output(event_to_memory(obs)))
+                recent_events.append(event_to_memory(obs))
 
         # add the last messages to long term memory
         if self.memory is not None and state.history and len(state.history) > 0:
             self.memory.add_event(event_to_memory(state.history[-1][0]))
-            self.memory.add_event(
-                self._truncate_output(event_to_memory(state.history[-1][1]))
-            )
+            self.memory.add_event(event_to_memory(state.history[-1][1]))
 
         # the action prompt with initial thoughts and recent events
         prompt = prompts.get_request_action_prompt(
@@ -179,44 +179,11 @@ class MonologueAgent(Agent):
         ]
 
         # format all as a single message, a monologue
-        resp = self.llm.do_completion(messages=messages)
+        resp = self.llm.completion(messages=messages)
 
-        # get the next action from the response
-        action_resp = resp['choices'][0]['message']['content']
-
-        # keep track of max_chars fallback option
-        state.num_of_chars += len(prompt) + len(action_resp)
-
-        action = prompts.parse_action_response(action_resp)
+        action = self.response_parser.parse(resp)
         self.latest_action = action
         return action
-
-    def _truncate_output(
-        self, observation: dict, max_chars: int = MAX_OUTPUT_LENGTH
-    ) -> dict[str, str]:
-        """
-        Truncates the output of an observation to a maximum number of characters.
-
-        Parameters:
-        - output (str): The observation whose output to truncate
-        - max_chars (int): The maximum number of characters to allow
-
-        Returns:
-        - str: The truncated output
-        """
-        if (
-            'args' in observation
-            and 'output' in observation['args']
-            and len(observation['args']['output']) > max_chars
-        ):
-            output = observation['args']['output']
-            half = max_chars // 2
-            observation['args']['output'] = (
-                output[:half]
-                + '\n[... Output truncated due to length...]\n'
-                + output[-half:]
-            )
-        return observation
 
     def search_memory(self, query: str) -> list[str]:
         """

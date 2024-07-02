@@ -50,8 +50,13 @@ class EventStream:
     def _get_filename_for_id(self, id: int) -> str:
         return f'sessions/{self.sid}/events/{id}.json'
 
-    def _get_id_from_filename(self, filename: str) -> int:
-        return int(filename.split('/')[-1].split('.')[0])
+    @staticmethod
+    def _get_id_from_filename(filename: str) -> int:
+        try:
+            return int(filename.split('/')[-1].split('.')[0])
+        except ValueError:
+            logger.warning(f'get id from filename ({filename}) failed.')
+            return -1
 
     def get_events(self, start_id=0, end_id=None) -> Iterable[Event]:
         event_id = start_id
@@ -90,6 +95,7 @@ class EventStream:
 
     # TODO: make this not async
     async def add_event(self, event: Event, source: EventSource):
+        logger.debug(f'Adding event {event} from {source}')
         async with self._lock:
             event._id = self._cur_id  # type: ignore [attr-defined]
             self._cur_id += 1
@@ -100,6 +106,7 @@ class EventStream:
             self._file_store.write(
                 self._get_filename_for_id(event.id), json.dumps(data)
             )
-        for key, stack in self._subscribers.items():
+        for stack in self._subscribers.values():
             callback = stack[-1]
+            logger.debug(f'Notifying subscriber {callback} of event {event}')
             await callback(event)

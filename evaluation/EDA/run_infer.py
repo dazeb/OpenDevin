@@ -45,7 +45,7 @@ def codeact_user_response(state: State) -> str:
     msg = game.generate_user_response(model_guess)
     game.curr_turn += 1
     logger.info(f'Model guess: {model_guess}')
-    logger.info(f'Anwser response: {msg}')
+    logger.info(f'Answer response: {msg}')
     if 'bingo!' in msg.lower():
         return '/exit'
     return msg
@@ -65,8 +65,10 @@ AGENT_CLS_TO_INST_SUFFIX = {
 }
 
 
-def process_instance(instance, agent_class, metadata, reset_logger: bool = True):
-    # Setup the logger properly, so you can run multi-processing to parallize the evaluation
+def process_instance(
+    instance, agent_class, metadata, openai_api_key, reset_logger: bool = True
+):
+    # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     eval_output_dir = metadata['eval_output_dir']
     if reset_logger:
         # Set up logger
@@ -107,7 +109,7 @@ def process_instance(instance, agent_class, metadata, reset_logger: bool = True)
         answerer_model=metadata['answerer_model'],
         guesser_model=None,
         num_turns=metadata['max_iterations'],
-        openai_api_key=metadata['openai_api'],
+        openai_api_key=openai_api_key,
         guesser_kargs=guesser_kargs,
     )
 
@@ -124,6 +126,7 @@ def process_instance(instance, agent_class, metadata, reset_logger: bool = True)
         main(
             instruction,
             fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get(agent_class),
+            sid=instance['text'].strip(),
         )
     )
     # ======= Attempt to evaluate the agent's edits =======
@@ -153,7 +156,7 @@ def process_instance(instance, agent_class, metadata, reset_logger: bool = True)
             (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
         ],
         'metrics': metrics,
-        'error': state.error if state and state.error else None,
+        'error': state.last_error if state and state.last_error else None,
         'test_result': {
             'success': test_result,
             'final_message': final_message,
@@ -234,7 +237,6 @@ if __name__ == '__main__':
         'data_split': args.data_split,
         'answerer_model': args.answerer_model,
         'agent_class': agent_class,
-        'openai_api': args.OPENAI_API_KEY,
         'model_name': model_name,
         'max_iterations': max_iterations,
         'eval_output_dir': eval_output_dir,
@@ -317,6 +319,7 @@ if __name__ == '__main__':
                     instance,
                     agent_class,
                     metadata,
+                    args.OPENAI_API_KEY,
                     reset_logger=bool(num_workers > 1),
                 )
                 future.add_done_callback(update_progress)

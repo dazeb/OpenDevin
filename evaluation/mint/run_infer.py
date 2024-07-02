@@ -51,10 +51,8 @@ def codeact_user_response(state: State, task: Task, task_config: Dict[str, int])
     state.task_state = result_state
 
     if not result_state.latest_output:
-        if result_state.success:
-            msg = '/exit'
-        else:
-            msg = 'Something went wrong! No output from the model.'
+        # Task is finished
+        msg = '/exit'
     else:
         msg = result_state.latest_output['content']
 
@@ -92,7 +90,7 @@ def process_instance(
         workspace_mount_path = os.path.join(workspace_mount_path, str(os.getpid()))
         pathlib.Path(workspace_mount_path).mkdir(parents=True, exist_ok=True)
 
-    # Setup the logger properly, so you can run multi-processing to parallize the evaluation
+    # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
         # Set up logger
         log_file = os.path.join(
@@ -118,7 +116,9 @@ def process_instance(
     if not skip_workspace_mount:
         logger.info(f'Process-specific workspace mounted at {workspace_mount_path}')
 
-    sandbox = DockerSSHBox()
+    # use a session id for concurrent processing
+    sid = instance.task_id + '_' + str(os.getpid())
+    sandbox = DockerSSHBox(sid=sid)
 
     requirements_host_src = 'evaluation/mint/requirements.txt'
     requirements_sandbox_dest = '/opendevin/plugins/mint/requirements.txt'
@@ -161,6 +161,7 @@ def process_instance(
             instruction,
             fake_user_response_fn=fake_user_response_fn,
             sandbox=sandbox,
+            sid=sid,
         )
     )
 
@@ -184,7 +185,7 @@ def process_instance(
             (event_to_dict(action), event_to_dict(obs)) for action, obs in state.history
         ],
         'metrics': metrics,
-        'error': state.error if state and state.error else None,
+        'error': state.last_error if state and state.last_error else None,
         'test_result': task_state.success if task_state else False,
     }
 
